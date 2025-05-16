@@ -881,6 +881,27 @@ static void call_on_media_update( pjsip_inv_session *inv,
     status = pjmedia_sdp_neg_get_active_remote(inv->neg, &remote_sdp);
 
 
+    // trying to find RTPP ADDR from sdp
+    // a=rtpp-addr: 1.2.3.4:4000
+
+    pjmedia_sdp_media *media = NULL;
+    for (int i = 0; i < remote_sdp->media_count; i++) {
+        media = remote_sdp->media[i];
+        PJ_LOG(3,(THIS_FILE, ">>>> SDP media #%d %s", i, media->desc.media.ptr));
+        if (!strcmp(media->desc.media.ptr, "audio")) {
+            break;
+        }
+    }
+
+    if (media) { // found audio media
+        const pj_str_t rtpp_addr_name = { "rtpp-addr", 9 };
+        pjmedia_sdp_attr *rtpp = pjmedia_sdp_media_find_attr(media, &rtpp_addr_name, NULL);
+        if (rtpp) {
+            PJ_LOG(3,(THIS_FILE, ">>>> SDP media rtpp-addr found: %s", rtpp->value.ptr));
+        }
+    }
+
+
     /* Create stream info based on the media audio SDP. */
     status = pjmedia_stream_info_from_sdp(&stream_info, inv->dlg->pool,
                                           g_med_endpt,
@@ -895,7 +916,6 @@ static void call_on_media_update( pjsip_inv_session *inv,
     PJ_LOG(3,(THIS_FILE, ">>>>>>> RTP remote addr %s", RTPP_RTP_IP_PORT));
 
     char *replaced = "127.0.0.1";
-
     char *p = strstr(RTPP_HEADER, "X-RTPP-ADDR: ");
     int rtpp_port = 0;
     if (p) {
