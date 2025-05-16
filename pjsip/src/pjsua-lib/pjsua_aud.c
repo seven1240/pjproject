@@ -650,6 +650,9 @@ pj_status_t pjsua_aud_channel_update(pjsua_call_media *call_med,
             prm.stream_info.info.aud = *si;
             (*pjsua_var.ua_cfg.cb.on_stream_precreate)(call->index, &prm);
 
+            // allow the callback to change rem_addr
+            si->rem_addr = prm.stream_info.info.aud.rem_addr;
+
             /* Copy back only the fields which are allowed to be changed. */
             si->jb_init = prm.stream_info.info.aud.jb_init;
             si->jb_min_pre = prm.stream_info.info.aud.jb_min_pre;

@@ -18,6 +18,12 @@
  */
 #include "pjsua_app.h"
 
+
+// Since we only support one call, use a global RTPP header
+char RTPP_HEADER[128] = { 0 };
+char RTPP_RTP_IP_PORT[128] = { 0 };
+
+
 #define THIS_FILE       "pjsua_app.c"
 
 //#define STEREO_DEMO
@@ -269,11 +275,150 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
                       call_id,
                       (int)call_info.state_text.slen,
                       call_info.state_text.ptr));
+
+            if (call_info.state == PJSIP_INV_STATE_CONNECTING) {
+                int code;
+                pj_str_t reason;
+                pjsip_msg *msg;
+
+                /* This can only occur because of TX or RX message */
+                // pj_assert(e->type == PJSIP_EVENT_TSX_STATE);
+
+                if (e->body.tsx_state.type == PJSIP_EVENT_RX_MSG) {
+                    msg = e->body.tsx_state.src.rdata->msg_info.msg;
+                } else {
+                    msg = e->body.tsx_state.src.tdata->msg;
+                }
+
+                code = msg->line.status.code;
+                reason = msg->line.status.reason;
+
+                printf("====xxxx %d %s role=%d %p\n", code, reason.ptr, call_info.role, msg->body);
+
+                if (call_info.role==PJSIP_ROLE_UAC && code==200 &&
+                    msg->body != NULL &&
+                    call_info.media_status==PJSUA_CALL_MEDIA_NONE)
+                {
+                    PJ_LOG(3,(THIS_FILE, "Call %d state changed to %.*s",
+                        call_id,
+                        (int)call_info.state_text.slen,
+                        call_info.state_text.ptr));
+
+                    static const pj_str_t RTPP = { "X-RTPP-ADDR", 11 };
+                    struct pjsip_hdr *hdr = pjsip_msg_find_hdr_by_name(msg, &RTPP, NULL);
+
+                    if (hdr) {
+                        hdr->vptr->print_on(hdr, RTPP_HEADER, sizeof(RTPP_HEADER));
+                        PJ_LOG(3, (THIS_FILE, "================ RTPP header found =============== %s: %s\n",  hdr->name.ptr, RTPP_HEADER));
+                    }
+                }
+            }
         }
 
         if (current_call==PJSUA_INVALID_ID)
             current_call = call_id;
 
+    }
+}
+
+static void on_stream_precreate(pjsua_call_id call_id,
+    pjsua_on_stream_precreate_param *param)
+{
+    pjsua_call_info call_info;
+    pjsua_call_get_info(call_id, &call_info);
+
+    // replace rtpp addr
+    pjmedia_stream_info *stream_info = &param->stream_info.info.aud;
+
+    pj_sockaddr *rem_addr = &stream_info->rem_addr;
+    pj_sockaddr_print(rem_addr, RTPP_RTP_IP_PORT, sizeof(RTPP_RTP_IP_PORT), 1);
+    PJ_LOG(3,(THIS_FILE, ">>>>>>> SDP remote addr %s", RTPP_RTP_IP_PORT));
+
+    // replace the rem_addr to inv->rtpp_hdr here
+
+    char *replaced = "127.0.0.1";
+
+    char *p = strstr(RTPP_HEADER, "X-RTPP-ADDR: ");
+    int rtpp_port = 0;
+    if (p) {
+        replaced = p += 13; // strlen("X-RTPP-ADDR: ")
+        char *str_port = strchr(replaced, ':');
+        if (str_port) {
+            PJ_LOG(3,(THIS_FILE, ">>>>>>> changing to remote addr %s", replaced));
+            *str_port++ = '\0';
+            rtpp_port = atoi(str_port);
+        }
+    } else {
+        PJ_LOG(3,(THIS_FILE, ">>>>>>> no RTPP header found"));
+    }
+
+    if (rtpp_port > 0) {
+        pj_str_t addr;
+        pj_cstr(&addr, replaced);
+        pj_sockaddr_set_str_addr(pj_AF_INET(), rem_addr, &addr);
+        pj_sockaddr_set_port(rem_addr, rtpp_port);
+
+        char buf[128];
+        pj_sockaddr_print(rem_addr, buf, sizeof(buf), 1);
+        PJ_LOG(3,(THIS_FILE, ">>>>>>> remote addr replaced to %s", buf));
+    }
+}
+
+void on_stream_created2(pjsua_call_id call_id,
+    pjsua_on_stream_created_param *param)
+{
+    pjsua_call_info call_info;
+    pjsua_call_get_info(call_id, &call_info);
+
+    pjmedia_stream *stream = param->stream;
+
+
+    PJ_LOG(3,(THIS_FILE, ">>>>>>>--------------------------- send first stun packets for stream %p", stream));
+    PJ_LOG(2,(THIS_FILE, "===========Building and send some STUN packets ============"));
+    pj_stun_msg *stun_msg;
+    pj_uint8_t stun_buf[PJ_STUN_MAX_PKT_LEN];
+    pj_size_t stun_len;
+    pj_status_t stun_status;
+    pj_pool_t *pool = pjsua_pool_create("pool-for-this-call", 1000, 1000); // todo free it
+
+    /* Create STUN Binding request */
+    stun_status = pj_stun_msg_create(pool, PJ_STUN_BINDING_REQUEST,
+                                    PJ_STUN_MAGIC, NULL, &stun_msg);
+    if (stun_status == PJ_SUCCESS) {
+        // #define username "192.168.3.100:10000"
+        #define password "password"
+        #define software "pjsip"
+        pj_str_t tmp;
+        char *username = RTPP_RTP_IP_PORT;
+
+        pj_stun_msg_add_string_attr(pool, stun_msg, PJ_STUN_ATTR_USERNAME, pj_cstr(&tmp, username));
+        pj_stun_msg_add_string_attr(pool, stun_msg, PJ_STUN_ATTR_PASSWORD, pj_cstr(&tmp, password));
+        pj_stun_msg_add_string_attr(pool, stun_msg, PJ_STUN_ATTR_SOFTWARE, pj_cstr(&tmp, software));
+        pj_stun_msg_add_uint_attr(pool, stun_msg, PJ_STUN_ATTR_PRIORITY, 0);
+        pj_stun_msg_add_uint_attr(pool, stun_msg, PJ_STUN_ATTR_CONNECTION_ID, 0x12345678);
+        pj_stun_msg_add_uint_attr(pool, stun_msg, PJ_STUN_ATTR_ICE_CONTROLLING, 0);
+        stun_status = pj_stun_msg_encode(stun_msg, stun_buf, sizeof(stun_buf),
+                                    0, NULL, &stun_len);
+        if (stun_status == PJ_SUCCESS) {
+            PJ_LOG(4,(THIS_FILE, "Generated STUN binding request, length=%d", (int)stun_len));
+            char print[1500];
+            pj_stun_msg_dump(stun_msg, print, sizeof(print), NULL);
+            PJ_LOG(4,(THIS_FILE, "Reference message:\n%s", print));
+
+        } else {
+            PJ_LOG(4,(THIS_FILE,
+                    "Failed to encode STUN binding request, status=%d", stun_status));
+        }
+
+        pjmedia_transport *transport = pjmedia_stream_get_transport(stream);
+        pj_status_t status = pjmedia_transport_send_rtp(transport, stun_buf, stun_len);
+    
+        if (status != PJ_SUCCESS) {
+            PJ_PERROR(3,(THIS_FILE, status,
+                "Error sending RTP/DTMF end packet"));
+        } else {
+            PJ_LOG(4, (THIS_FILE, "Sent 1 STUN packet"));
+        }
     }
 }
 
@@ -1513,6 +1658,8 @@ static pj_status_t app_init(void)
 
     /* Initialize application callbacks */
     app_config.cfg.cb.on_call_state = &on_call_state;
+    app_config.cfg.cb.on_stream_precreate = &on_stream_precreate;
+    app_config.cfg.cb.on_stream_created2 = &on_stream_created2;
     app_config.cfg.cb.on_stream_destroyed = &on_stream_destroyed;
     app_config.cfg.cb.on_call_media_state = &on_call_media_state;
     app_config.cfg.cb.on_incoming_call = &on_incoming_call;

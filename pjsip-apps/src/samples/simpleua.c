@@ -59,6 +59,10 @@
 #include <pjlib-util.h>
 #include <pjlib.h>
 
+// Since we only support one call, use a global RTPP header
+char RTPP_HEADER[128] = { 0 };
+char RTPP_RTP_IP_PORT[128] = { 0 };
+
 /* For logging purpose. */
 #define THIS_FILE   "simpleua.c"
 
@@ -73,7 +77,7 @@
 #define SIP_PORT        5080         /* Listening SIP port              */
 #define RTP_PORT        5000         /* RTP port                        */
 #else
-#define SIP_PORT        5060         /* Listening SIP port              */
+#define SIP_PORT        55060         /* Listening SIP port              */
 #define RTP_PORT        4000         /* RTP port                        */
 #endif
 
@@ -660,6 +664,19 @@ static void call_on_state_changed( pjsip_inv_session *inv,
         PJ_LOG(3,(THIS_FILE, "Call state changed to %s", 
                   pjsip_inv_state_name(inv->state)));
 
+
+        if (inv->state == PJSIP_INV_STATE_CONNECTING) { // got 200 OK ?
+            pjsip_rx_data *rdata = e->body.rx_msg.rdata;
+            PJ_LOG(3,(THIS_FILE, ">>>> rdata %p", rdata));
+            static const pj_str_t RTPP = { "X-RTPP-ADDR", 11 };
+            struct pjsip_hdr *hdr = pjsip_msg_find_hdr_by_name(rdata->msg_info.msg, &RTPP, NULL);
+    
+            if (hdr) {
+                // hdr->vptr->print_on(hdr, inv->rtpp_hdr, sizeof(inv->rtpp_hdr));
+                hdr->vptr->print_on(hdr, RTPP_HEADER, sizeof(RTPP_HEADER));
+                PJ_LOG(3, (THIS_FILE, ">>>> ================ RTPP header found =============== %s: %s\n",  hdr->name.ptr, RTPP_HEADER));
+            }
+        }
     }
 }
 
@@ -873,6 +890,37 @@ static void call_on_media_update( pjsip_inv_session *inv,
         return;
     }
 
+    pj_sockaddr *rem_addr = &stream_info.rem_addr;
+    pj_sockaddr_print(rem_addr, RTPP_RTP_IP_PORT, sizeof(RTPP_RTP_IP_PORT), 1);
+    PJ_LOG(3,(THIS_FILE, ">>>>>>> RTP remote addr %s", RTPP_RTP_IP_PORT));
+
+    char *replaced = "127.0.0.1";
+
+    char *p = strstr(RTPP_HEADER, "X-RTPP-ADDR: ");
+    int rtpp_port = 0;
+    if (p) {
+        replaced = p += 13; // strlen("X-RTPP-ADDR: ")
+        char *str_port = strchr(replaced, ':');
+        if (str_port) {
+            PJ_LOG(3,(THIS_FILE, ">>>>>>> changing to remote addr %s", replaced));
+            *str_port++ = '\0';
+            rtpp_port = atoi(str_port);
+        }
+    } else {
+        PJ_LOG(3,(THIS_FILE, ">>>>>>> no RTPP header found"));
+    }
+
+    if (rtpp_port > 0) {
+        pj_str_t addr;
+        pj_cstr(&addr, replaced);
+        pj_sockaddr_set_str_addr(pj_AF_INET(), rem_addr, &addr);
+        pj_sockaddr_set_port(rem_addr, rtpp_port);
+
+        char buf[128];
+        pj_sockaddr_print(rem_addr, buf, sizeof(buf), 1);
+        PJ_LOG(3,(THIS_FILE, ">>>>>>> remote addr replaced to %s", buf));
+    }
+
     /* If required, we can also change some settings in the stream info,
      * (such as jitter buffer settings, codec settings, etc) before we
      * create the stream.
@@ -887,6 +935,7 @@ static void call_on_media_update( pjsip_inv_session *inv,
         app_perror( THIS_FILE, "Unable to create audio stream", status);
         return;
     }
+    PJ_LOG(3,(THIS_FILE, ">>>> audio stream created %p", g_med_stream));
 
     /* Start the audio stream */
     status = pjmedia_stream_start(g_med_stream);
@@ -894,6 +943,7 @@ static void call_on_media_update( pjsip_inv_session *inv,
         app_perror( THIS_FILE, "Unable to start audio stream", status);
         return;
     }
+    PJ_LOG(3,(THIS_FILE, ">>>> audio stream started %p", g_med_stream));
 
     /* Start the UDP media transport */
     status = pjmedia_transport_media_start(g_med_transport[0], 0, 0, 0, 0);
@@ -901,6 +951,57 @@ static void call_on_media_update( pjsip_inv_session *inv,
         app_perror( THIS_FILE, "Unable to start UDP media transport", status);
         return;
     }
+    PJ_LOG(3,(THIS_FILE, ">>>> UDP media transport started [%s]", g_med_transport[0]->name));
+
+
+    // ok, the transport is ready, we can send some STUN packets
+    PJ_LOG(2,(THIS_FILE, "===========Building and send some STUN packets ============"));
+    pj_stun_msg *stun_msg;
+    pj_uint8_t stun_buf[PJ_STUN_MAX_PKT_LEN];
+    pj_size_t stun_len;
+    pj_status_t stun_status;
+    pj_pool_t *pool = inv->dlg->pool;
+
+    /* Create STUN Binding request */
+    stun_status = pj_stun_msg_create(pool, PJ_STUN_BINDING_REQUEST,
+                                    PJ_STUN_MAGIC, NULL, &stun_msg);
+    if (stun_status == PJ_SUCCESS) {
+        // #define username "192.168.3.100:10000"
+        #define password "password"
+        #define software "pjsip"
+        pj_str_t tmp;
+        char *username = RTPP_RTP_IP_PORT;
+
+        pj_stun_msg_add_string_attr(pool, stun_msg, PJ_STUN_ATTR_USERNAME, pj_cstr(&tmp, username));
+        pj_stun_msg_add_string_attr(pool, stun_msg, PJ_STUN_ATTR_PASSWORD, pj_cstr(&tmp, password));
+        pj_stun_msg_add_string_attr(pool, stun_msg, PJ_STUN_ATTR_SOFTWARE, pj_cstr(&tmp, software));
+        pj_stun_msg_add_uint_attr(pool, stun_msg, PJ_STUN_ATTR_PRIORITY, 0);
+        pj_stun_msg_add_uint_attr(pool, stun_msg, PJ_STUN_ATTR_CONNECTION_ID, 0x12345678);
+        pj_stun_msg_add_uint_attr(pool, stun_msg, PJ_STUN_ATTR_ICE_CONTROLLING, 0);
+        stun_status = pj_stun_msg_encode(stun_msg, stun_buf, sizeof(stun_buf),
+                                    0, NULL, &stun_len);
+        if (stun_status == PJ_SUCCESS) {
+            PJ_LOG(4,(THIS_FILE, "Generated STUN binding request, length=%d", (int)stun_len));
+            char print[1500];
+            pj_stun_msg_dump(stun_msg, print, sizeof(print), NULL);
+            PJ_LOG(4,(THIS_FILE, "Reference message:\n%s", print));
+
+        } else {
+            PJ_LOG(4,(THIS_FILE,
+                    "Failed to encode STUN binding request, status=%d", stun_status));
+        }
+
+        pjmedia_transport *transport = pjmedia_stream_get_transport(g_med_stream);
+        pj_status_t status = pjmedia_transport_send_rtp(transport, stun_buf, stun_len);
+
+        if (status != PJ_SUCCESS) {
+            PJ_PERROR(3,(THIS_FILE, status,
+                "Error sending RTP/DTMF end packet"));
+        } else {
+            PJ_LOG(4, (THIS_FILE, "Sent 1 STUN packet"));
+        }
+    }
+
 
     /* Get the media port interface of the audio stream. 
      * Media port interface is basicly a struct containing get_frame() and
@@ -1086,4 +1187,3 @@ static void call_on_media_update( pjsip_inv_session *inv,
 
     /* Done with media. */
 }
-
